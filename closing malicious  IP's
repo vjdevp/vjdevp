@@ -1,0 +1,162 @@
+#!/bin/bash
+
+# Variables
+KIBANA_URL="https:"
+API_ENDPOINT="/api/detection_engine/signals/search"
+AUTH_HEADER="Authorization: Basic ZGFzaGVlZC5zOlBheXN3aWZmQDIwMjQ="
+KBN_XSRF_HEADER="kbn-xsrf: true"
+OUTPUT_FILE="output.json"
+INPUT_FILE="ip_list.txt"
+RESULT_FILE="virus_check_results.txt"
+MALICIOUS_FILE="malicious_results.txt"
+
+# VirusTotal API key
+API_KEY="e9c5ffe64519cfcf561144a146578d4fd7fb7bb381f9808415854e55851e9d71"
+
+# Google Chat Webhook URL
+WEBHOOK_URL=
+
+# Function to send message to Google Chat
+send_to_hangouts() {
+    local message=$1
+    echo "Sending message to Hangouts: ${message}"  # Debugging line
+    curl -X POST -H 'Content-Type: application/json' \
+        --data "{\"text\": \"${message}\"}" \
+        "${WEBHOOK_URL}"
+}
+
+# Get current time and time 24 hours ago in ISO 8601 format
+CURRENT_TIME=$(date -u +"%Y-%m-%dT%H:%M:%S.%3NZ")
+TWENTY_FOUR_HOURS_AGO=$(date -u -d "24 hours ago" +"%Y-%m-%dT%H:%M:%S.%3NZ")
+
+# Fetch data from Kibana API for specific alerts within the last 24 hours
+echo "Fetching security alerts from the last 24 hours..."
+HTTP_STATUS=$(curl -s -o "${OUTPUT_FILE}" -w "%{http_code}" -X POST "${KIBANA_URL}${API_ENDPOINT}" \
+-H "${AUTH_HEADER}" \
+-H "${KBN_XSRF_HEADER}" \
+-H "Content-Type: application/json" \
+-d '{
+  "query": {
+    "bool": {
+      "must": [
+        { "match": { "kibana.alert.rule.name": "Threat Intel IP Address Indicator Match" }},
+        { "match": { "kibana.alert.workflow_status": "open" }},
+        { "range": { "@timestamp": { "gte": "'"${TWENTY_FOUR_HOURS_AGO}"'", "lte": "'"${CURRENT_TIME}"'" }}}
+      ]
+    }
+  },
+  "_source": ["source.ip"],
+  "size": 10000
+}')
+
+# Check if the HTTP status code is 200
+if [ "$HTTP_STATUS" -ne 200 ]; then
+  echo "Failed to fetch data. HTTP status code: $HTTP_STATUS"
+  send_to_hangouts "Failed to fetch data from Kibana. HTTP status code: $HTTP_STATUS."
+  exit 1
+fi
+
+# Check if the output file contains data
+if [ ! -s "$OUTPUT_FILE" ]; then
+  echo "No alerts found in the last 24 hours."
+  send_to_hangouts "No alerts found in the last 24 hours."
+  exit 0
+fi
+
+# Extract IP addresses, count occurrences, and save to a file
+TOTAL_COUNT=0
+
+echo -e "\nIP Address Hit Counts in the Last 24 Hours:"
+echo "---------------------------------------------------"
+
+if command -v jq &> /dev/null; then
+  # Using jq to parse and process JSON
+  jq -r '.hits.hits[]._source.source.ip' "$OUTPUT_FILE" | sort | uniq -c | awk '{printf "%s %s\n", $2, $1; total += $1} END {print "Total Count: " total}' | tee "$INPUT_FILE"
+else
+  # Using grep and awk for processing
+  grep -oP '"source":\{"ip":"\K[0-9.]+' "$OUTPUT_FILE" | sort | uniq -c | awk '{printf "%s %s\n", $2, $1; total += $1} END {print "Total Count: " total}' | tee "$INPUT_FILE"
+fi
+
+# Clean up
+rm -f "$OUTPUT_FILE"
+
+# Initialize files
+> "$RESULT_FILE"  # Initialize result file
+> "$MALICIOUS_FILE"  # Initialize malicious result file
+
+# Initialize total counts
+TOTAL_IP_COUNT=0
+TOTAL_MALICIOUS_COUNT=0
+
+# Check each IP address in VirusTotal and print results
+while IFS= read -r line; do
+  # Extract IP address and hit count from the line
+  IP=$(echo "$line" | awk '{print $1}')
+  COUNT=$(echo "$line" | awk '{print $2}')
+
+  if [ -z "$IP" ]; then
+    continue
+  fi
+
+  URL="https://www.virustotal.com/api/v3/ip_addresses/${IP}"
+
+  echo "Fetching VirusTotal data for IP: ${IP}"
+  response_body=$(curl -s -X GET "${URL}" \
+     -H "x-apikey: ${API_KEY}" \
+     -H "Content-Type: application/json")
+
+  # Extracting malicious counts at various levels
+  malicious_counts=$(echo "$response_body" | grep -o '"malicious": [0-9]*' | awk '{print $2}' | sed 's/[^0-9]//g')
+
+  # Initialize the status as clean
+  status="clean"
+
+  # Check if any malicious count is greater than 0
+  for count in $malicious_counts; do
+    if [[ "$count" -gt 0 ]]; then
+      status="malicious"
+      TOTAL_MALICIOUS_COUNT=$((TOTAL_MALICIOUS_COUNT + COUNT))
+      break
+    fi
+  done
+
+  # Append the result to the result file
+  echo "$IP $COUNT $status" >> "$RESULT_FILE"
+
+  # If the IP is malicious, append to malicious result file
+  if [ "$status" == "malicious" ]; then
+    echo "$IP $COUNT $status" >> "$MALICIOUS_FILE"
+  fi
+
+  # Update total IP count
+  TOTAL_IP_COUNT=$((TOTAL_IP_COUNT + COUNT))
+
+done < "$INPUT_FILE"
+
+# Summarize results
+echo -e "\nVirusTotal Check Results:"
+echo "---------------------------------------------------"
+
+# Format the table with fixed-width columns
+printf "%-15s %-5s %-10s\n" "IP Address" "Count" "Status"
+echo "---------------------------------------------------"
+while IFS= read -r line; do
+  IP=$(echo "$line" | awk '{print $1}')
+  COUNT=$(echo "$line" | awk '{print $2}')
+  STATUS=$(echo "$line" | awk '{print $3}')
+  printf "%-15s %-5s %-10s\n" "$IP" "$COUNT" "$STATUS"
+done < "$RESULT_FILE"
+
+echo -e "\nTotal IP Count: $TOTAL_IP_COUNT"
+echo "Total Malicious Count: $TOTAL_MALICIOUS_COUNT"
+
+# Send results to Google Chat
+if [ -s "$MALICIOUS_FILE" ]; then
+  malicious_message=$(awk '{printf "%-15s %-5s %-10s\n", $1, $2, $3}' "$MALICIOUS_FILE")
+  send_to_hangouts "Malicious IPs detected by VirusTotal:\n$(printf "%-15s %-5s %-10s\n" "IP Address" "Count" "Status")\n$(echo "$malicious_message")\nTotal Malicious Count: $TOTAL_MALICIOUS_COUNT"
+else
+  send_to_hangouts "No malicious IPs detected by VirusTotal.\nTotal IP Count: $TOTAL_IP_COUNT."
+fi
+
+echo "Script execution completed."
+
